@@ -3,6 +3,10 @@ use std::f32::consts::TAU;
 use std::future;
 
 use bevy::input::mouse::MouseMotion;
+use bevy::pbr::CascadeShadowConfig;
+use bevy::pbr::CascadeShadowConfigBuilder;
+use bevy::pbr::Cascades;
+use bevy::pbr::DirectionalLightShadowMap;
 use bevy::prelude::*;
 use bevy::render::color::Color;
 use bevy::render::mesh::Indices;
@@ -23,6 +27,18 @@ pub enum Block {
     Void,
     Air,
     Stone,
+    Grass,
+}
+
+impl Block {
+    fn color(self) -> Vec4 { 
+        match self {
+            Block::Void => Vec4::new(1.0, 0.0, 1.0, 1.0),
+            Block::Stone => Vec4::new(0.4, 0.4, 0.4, 1.0),
+            Block::Grass => Vec4::new(0.0, 0.6, 0.09, 1.0),
+            _ => Vec4::splat(0.0)
+        }
+    }
 }
 
 pub trait Structure {
@@ -34,6 +50,8 @@ pub trait Structure {
     fn set_block(&mut self, position: UVec3, block: Block);
     fn get_cull(&self, position: UVec3) -> Direction;
     fn set_cull(&mut self, position: UVec3, direction: Direction);
+    fn get_ao(&self, position: UVec3) -> [Vec4; 6];
+    fn set_ao(&mut self, position: UVec3, ao: [Vec4; 6]);
 
     fn size(&self) -> UVec3;
 
@@ -67,6 +85,7 @@ pub trait Structure {
 pub struct ChunkBlockInfo {
     block: Block,
     cull_faces: Direction,
+    ao: [Vec4; 6],
 }
 
 pub struct Chunk {
@@ -82,7 +101,8 @@ impl Structure for Chunk {
             data: vec![
                 ChunkBlockInfo {
                     block: Block::Void,
-                    cull_faces: Direction::empty()
+                    cull_faces: Direction::empty(),
+                    ao: [Vec4::default(); 6]
                 };
                 64 * 64 * 64
             ],
@@ -108,6 +128,16 @@ impl Structure for Chunk {
         let index = self.linearize(position);
         self.data[index].cull_faces = direction;
     }
+    
+    fn get_ao(&self, position: UVec3) -> [Vec4; 6] {
+        let index = self.linearize(position);
+        self.data[index].ao
+    }
+
+    fn set_ao(&mut self, position: UVec3, ao: [Vec4; 6]) {
+        let index = self.linearize(position);
+        self.data[index].ao = ao;
+    }
 
     fn size(&self) -> UVec3 {
         UVec3::new(64, 64, 64)
@@ -122,15 +152,38 @@ bitflags! {
         const DOWN =    0b00000100;
         const UP =      0b00001000;
         const BACK =    0b00010000;
-        const FOWARD =  0b00100000;
+        const FORWARD =  0b00100000;
         const ALL =  0b00111111;
+    }
+}
+
+impl Direction {
+    fn opposite(self) -> Self {
+        if self & Self::LEFT == Direction::empty() {
+            Self::RIGHT
+        } else if self & Self::RIGHT == Direction::empty() {
+            Self::LEFT
+        } else if self & Self::DOWN == Direction::empty() {
+            Self::UP
+        } else if self & Self::UP == Direction::empty() {
+            Self::DOWN
+        } else if self & Self::BACK == Direction::empty() {
+            Self::FORWARD
+        } else if self & Self::FORWARD == Direction::empty() {
+            Self::UP
+        } else {
+            panic!("cannot have opposite of multiple directions");
+        }
     }
 }
 
 fn cube_mesh_parts(
     position: Vec3,
     directions: Direction,
+    color: Vec4,
+    ao: [Vec4; 6],
     vertices: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
     normals: &mut Vec<[f32; 3]>,
     indices: &mut Vec<u32>,
 ) {
@@ -238,6 +291,11 @@ fn cube_mesh_parts(
                 .iter()
                 .map(|unit| (Vec3::from_array(*unit) + position).to_array()),
         );
+        let [a, b, c, d] = ao[index].to_array();
+        colors.push((color * Vec4::new(c, c, c, 1.0)).to_array());
+        colors.push((color * Vec4::new(b, b, b, 1.0)).to_array());
+        colors.push((color * Vec4::new(a, a, a, 1.0)).to_array());
+        colors.push((color * Vec4::new(d, d, d, 1.0)).to_array());
         normals.extend(cube_normals[index].iter());
         indices.extend(cube_indices[index].iter().map(|i| (count + i % 4) as u32))
     }
@@ -246,6 +304,7 @@ fn cube_mesh_parts(
 #[rustfmt::skip]
 fn create_structure_mesh(structure: &dyn Structure) -> Mesh {
     let mut vertices = vec![];
+    let mut colors = vec![];
     let mut normals = vec![];
     let mut indices = vec![];
 
@@ -253,14 +312,17 @@ fn create_structure_mesh(structure: &dyn Structure) -> Mesh {
     for index in 0..structure.count() {
         let position = structure.delinearize(index);
         if !matches!(structure.get_block(position), Block::Air) {
-            cube_mesh_parts(position.as_vec3(), structure.get_cull(position), &mut vertices, &mut normals, &mut indices);
+            cube_mesh_parts(position.as_vec3(), structure.get_cull(position), structure.get_block(position).color(), structure.get_ao(position), &mut vertices, &mut colors, &mut normals, &mut indices);
         }
     }
-dbg!(vertices.len());
     Mesh::new(PrimitiveTopology::TriangleList)
     .with_inserted_attribute(
         Mesh::ATTRIBUTE_POSITION,
             vertices
+    )
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_COLOR,
+            colors
     )
     .with_inserted_attribute(
         Mesh::ATTRIBUTE_NORMAL,
@@ -286,15 +348,10 @@ fn camera(
         y: 0,
         z: keys.pressed(KeyCode::S) as i32 - keys.pressed(KeyCode::W) as i32,
     };
-    let vertical_direction = IVec3 {
-        x: 0,
-        y: keys.pressed(KeyCode::Space) as i32 - keys.pressed(KeyCode::ShiftLeft) as i32,
-        z: 0,
-    };
     let rotation = Quat::from_axis_angle(Vec3::Y, parent_transform.rotation.to_euler(EulerRot::YXZ).0);
     let movement = speed
         * time.delta_seconds()
-        * (rotation * lateral_direction.as_vec3() + vertical_direction.as_vec3())
+        * (rotation * lateral_direction.as_vec3())
             .normalize_or_zero();
     parent_transform.translation += movement;
 }
@@ -313,8 +370,12 @@ fn setup(
         ..default()
     }).id();
     commands.spawn((GlobalTransform::default(), Transform::from_xyz(0.0, 0.0, 0.0))).push_children(&[camera]);
-    let mut light_transform = Transform::from_xyz(1000.0, 10000.0, 1000.0);
+    let mut light_transform = Transform::from_xyz(1000.0, 1000.0, 1000.0);
     light_transform.look_at(Vec3::ZERO, Vec3::Y);
+    let mut cascade_shadow_config_builder = CascadeShadowConfigBuilder::default();
+    cascade_shadow_config_builder.first_cascade_far_bound = 1300.0;
+    cascade_shadow_config_builder.minimum_distance = 1200.0;
+    cascade_shadow_config_builder.maximum_distance = 2000.0;
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
             color: Color::Rgba {
@@ -327,6 +388,7 @@ fn setup(
             shadows_enabled: true,
             ..default()
         },
+        cascade_shadow_config: cascade_shadow_config_builder.build(),
         transform: light_transform,
         ..default()
     });
@@ -350,7 +412,7 @@ fn spawn(
 ) {
     let mut not_done_futures = vec![];
     let mut future_drain_iter = world.chunk_futures.drain(..);
-    let max = 1;
+    let max = 3;
     let mut count = 0;
     while let Some(chunk_future) = future_drain_iter.next() {
         if count >= max {
@@ -361,12 +423,10 @@ fn spawn(
             not_done_futures.push(chunk_future);
             continue;
         }
-        dbg!("done");
         tasks::block_on(async {
             let (position, chunk) = chunk_future.await;
 
             let cube_mesh_handle: Handle<Mesh> = meshes.add(create_structure_mesh(&chunk));
-            dbg!("spawned");
             commands.spawn(
                 (PbrBundle {
                     mesh: cube_mesh_handle,
@@ -404,7 +464,6 @@ fn load(
     let (_, camera_parent) = query1.single();
     let camera_transform = query2.get(camera_parent.get()).unwrap();
     let position = camera_transform.translation.as_ivec3() / 64;
-    dbg!(position);
     if position == world.origin {
         return;
     }
@@ -432,6 +491,7 @@ fn load(
             AsyncComputeTaskPool::get_or_init(|| TaskPool::new()).spawn(async move {
                 let mut chunk = gen_chunk(position);
                 internal_cull_faces(&mut chunk);
+                internal_ao(&mut chunk);
 
                 (position, chunk)
             });
@@ -446,7 +506,8 @@ fn gen_chunk(position: IVec3) -> Chunk {
         data: vec![
             ChunkBlockInfo {
                 block: Block::Void,
-                cull_faces: Direction::empty()
+                cull_faces: Direction::empty(),
+                ao: [Vec4::default(); 6]
             };
             64 * 64 * 64
         ],
@@ -536,7 +597,7 @@ fn gen_chunk(position: IVec3) -> Chunk {
                 chunk.set_block(
                     UVec3 { x, y, z },
                     if density + density_mod > 0.0 {
-                        Block::Stone
+                        Block::Grass
                     } else {
                         Block::Air
                     },
@@ -567,8 +628,7 @@ fn internal_cull_faces(structure: &mut dyn Structure) {
                 let current_direction = dir_iter.next().unwrap();
                 let mut normal = IVec3::default();
                 normal[d] = n;
-                let normal = normal.as_uvec3();
-                let neighbor = position + normal;
+                let neighbor = (position.as_ivec3() + normal).as_uvec3();
                 if neighbor.x >= sx || neighbor.y >= sy || neighbor.z >= sz {
                     continue;
                 }
@@ -584,12 +644,75 @@ fn internal_cull_faces(structure: &mut dyn Structure) {
     }
 }
 
+fn internal_ao(structure: &mut dyn Structure) {
+    
+
+    for index in 0..structure.count() {
+        let mut dir_iter = (0..6)
+            .map(|x| 1 << x)
+            .map(Direction::from_bits)
+            .map(Option::unwrap);
+        let mut directions = Direction::empty();
+
+        let position = structure.delinearize(index);
+        let mut ao = structure.get_ao(position);
+        for d in 0..3 {
+            for n in (-1..=1).step_by(2) {
+                let current_direction = dir_iter.next().unwrap();
+                let mut normal = IVec3::default();
+                normal[d] = n;
+                let direction_index = current_direction.bits().trailing_zeros() as usize;
+                ao[direction_index] = voxel_ao(structure, position.as_ivec3() + normal, IVec3 { x: normal.z.abs(), y: normal.x.abs(), z: normal.y.abs() },
+                IVec3 { x: normal.y.abs(), y: normal.z.abs(), z: normal.x.abs() },
+            );
+            }
+        }
+        structure.set_ao(position, ao);
+    }
+}
+
+fn voxel_ao(structure: &dyn Structure, pos: IVec3, d1: IVec3, d2: IVec3) -> Vec4 {
+    let UVec3 {
+        x: sx,
+        y: sy,
+        z: sz,
+    } = structure.size();
+    let voxel_present = |pos: IVec3| -> f32 {
+        let pos = pos.as_uvec3();
+        if pos.x >= sx || pos.y >= sy || pos.z >= sz {
+            0.0
+        } else {
+            !matches!(structure.get_block(pos), Block::Air) as i32 as f32
+        }
+    };
+    let vertex_ao = |side: Vec2, corner: f32| {
+        (side.x + side.y + f32::max(corner, side.x * side.y)) / 3.0
+    };
+    let side = Vec4::new(
+        (voxel_present)(pos + d1),
+        (voxel_present)(pos + d2),
+        (voxel_present)(pos - d1),
+        (voxel_present)(pos - d2)
+    );
+    let corner = Vec4::new(
+        (voxel_present)(pos + d1 + d2),
+        (voxel_present)(pos - d1 + d2),
+        (voxel_present)(pos - d1 - d2),
+        (voxel_present)(pos + d1 - d2)
+    );
+    1.0 - Vec4::new(
+        (vertex_ao)(Vec2::new(side.x, side.y), corner.x),
+        (vertex_ao)(Vec2::new(side.y, side.z), corner.y),
+        (vertex_ao)(Vec2::new(side.z, side.w), corner.z),
+        (vertex_ao)(Vec2::new(side.w, side.x), corner.w),
+    )
+}
+
 fn main() {
-    dbg!("yo");
     let mut app = App::new();
 
     app.insert_resource(World {
-        view: 8,
+        view: 2,
         origin: IVec3 {
             x: i32::MAX,
             y: 0,
@@ -599,7 +722,7 @@ fn main() {
         mapping: HashMap::new(),
         chunk_futures: Vec::new(),
     });
-
+    app.insert_resource(DirectionalLightShadowMap { size: 4096 });
     app.add_plugins(DefaultPlugins);
     app.add_systems(Startup, setup)
         .add_systems(Update, load)
