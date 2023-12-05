@@ -10,3 +10,10 @@ bevy = "*"
 bitflags = "*"
 noise = "*"
 lerp = "*"
+bezier-nd = "*"
+geo-nd = "*"
+derive_more = "*"
+voxels = { path = "../../voxels" }
+
+[profile.release]
+debug = true
