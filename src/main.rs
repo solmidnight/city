@@ -1125,6 +1125,28 @@ fn set_block(bevy_world: &mut bevy::prelude::World, position: IVec3, block: Bloc
     }
 }
 
+fn get_block(bevy_world: &mut bevy::prelude::World, position: IVec3) -> Option<Block> {
+    let chunk_position = position.div_euclid(IVec3::splat(CHUNK_AXIS as i32));
+
+    if let Some(&chunk_entity) = bevy_world.resource::<World>().mapping.get(&chunk_position) {
+        let mut chunk = bevy_world.get_mut::<Structure>(chunk_entity).unwrap();
+
+        let local_position = position
+            .rem_euclid(IVec3::splat(CHUNK_AXIS as i32))
+            .as_uvec3();
+
+        return chunk.get_block(iter::once(local_position)).next();
+    }
+    None
+}
+
+fn get_ground_level(bevy_world: &mut bevy::prelude::World, mut position: IVec3) -> i32 {
+    while !matches!(get_block(bevy_world, position), Some(Block::Air)) {
+        position += 1;
+    }
+    position.y
+}
+
 bitflags! {
     #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct LineMode: u64 {
@@ -1226,8 +1248,10 @@ fn build_road(bevy_world: &mut bevy::prelude::World) {
     let curve = Bezier::cubic(&a, &b, &c, &d);
 
     for (a, b) in curve.as_lines(0.01) {
-        let a = Vec3::from_array(a.into()).as_ivec3();
-        let b = Vec3::from_array(b.into()).as_ivec3();
+        let mut a = Vec3::from_array(a.into()).as_ivec3();
+        let mut b = Vec3::from_array(b.into()).as_ivec3();
+        a.y = get_ground_level(bevy_world, a);
+        b.y = get_ground_level(bevy_world, b);
         draw_line(a, b, LineMode::MAJOR, |pos| set_block(bevy_world, pos, Block::Stone));
     }
 }
